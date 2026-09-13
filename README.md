@@ -22,7 +22,7 @@ cd blackjack-cli
 
 2. Запустите игру:
 ```bash
-go run main.go
+go run blackjack.go
 ```
 
 Доступные флаги при запуске:
