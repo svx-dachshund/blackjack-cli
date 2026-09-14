@@ -1,6 +1,9 @@
 # blackjack-cli
 Карточная игра "Блэкджек", написанная на Go.
 
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/svx-dachshund/blackjack-cli/total)
+![GitHub Repo stars](https://img.shields.io/github/stars/svx-dachshund/blackjack-cli)
+
 ---
 
 ### Особенности реализации
