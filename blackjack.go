@@ -25,7 +25,7 @@ const (
 	maxScore             = 21
 	blackjackPayoutMul   = 3
 	blackjackPayoutDenom = 2 // 3:2
-	insurancePayoutMul   = 2 // 2:1
+	insurancePayoutMul   = 2 // 2:1 (прибыль), полный возврат = 3 × insuranceBet
 	payoutReturnFactor   = 2 // возврат ставки + выигрыш 1:1
 	surrenderRefundDiv   = 2 // деление ставки пополам при сдаче
 	insuranceBetDiv      = 2 // страховка = половина ставки
@@ -38,7 +38,7 @@ const (
 	defaultInitialPlayer = 1000
 	defaultInitialDealer = 5000
 	defaultMaxSplits     = 3
-	dealerSleepMs        = 800
+	defaultDealerSleepMs = 800
 
 	// Действия игрока.
 	actionHit       = "h"
@@ -62,7 +62,8 @@ type config struct {
 	doubleDownScores      []int
 	dealerHitsSoft17      bool
 	allowDoubleAfterSplit bool
-	maxSplits             int // 0 = без ограничений
+	maxSplits             int // 0 = без ограничений; число доп. рук от сплита
+	dealerSleepMs         int
 }
 
 func defaultConfig() config {
@@ -75,6 +76,7 @@ func defaultConfig() config {
 		dealerHitsSoft17:      true,
 		allowDoubleAfterSplit: true,
 		maxSplits:             defaultMaxSplits,
+		dealerSleepMs:         defaultDealerSleepMs,
 	}
 }
 
@@ -133,9 +135,9 @@ func (h *hand) IsSoft() bool {
 }
 
 // IsBlackjack возвращает true, если в руке ровно две карты и сумма очков равна 21,
-// и рука не является результатом сплита тузов (сплит тузов не даёт блэкджека).
+// и рука не является результатом сплита (сплит-руки, включая A+10, не дают блэкджека).
 func (h *hand) IsBlackjack() bool {
-	return !h.IsSplitAce && len(h.Cards) == 2 && h.Score() == maxScore
+	return !h.IsSplit && !h.IsSplitAce && len(h.Cards) == 2 && h.Score() == maxScore
 }
 
 // CanSplit проверяет, можно ли разделить руку.
@@ -160,9 +162,9 @@ const resetColor = "\033[0m"
 func cardColor(c card) string {
 	switch c.Suit {
 	case "♥", "♦":
-		return "\033[31m"
+		return "\033[31m" // красный
 	default:
-		return "\033[37m"
+		return "\033[97m" // ярко-белый
 	}
 }
 
@@ -200,7 +202,9 @@ func (h *hand) Print(hideSecond bool) {
 		return
 	}
 
-	var allLines [4]string
+	const cardHeight = 4
+
+	allLines := make([]string, cardHeight)
 
 	for cardIdx, c := range h.Cards {
 		var lines []string
@@ -210,7 +214,7 @@ func (h *hand) Print(hideSecond bool) {
 			lines = getCardLines(c)
 		}
 
-		for j := range 4 {
+		for j := range cardHeight {
 			if cardIdx > 0 {
 				allLines[j] += " "
 			}
@@ -236,7 +240,7 @@ func (h *hand) Print(hideSecond bool) {
 
 type shoe struct {
 	Cards []card
-	total int // исходное количество карт для расчёта карты среза
+	total int
 }
 
 // newShoe создаёт новую колоду (обувь) из numDecks колод и перемешивает.
@@ -260,7 +264,6 @@ func newShoe(numDecks int) *shoe {
 			}
 		}
 	}
-	// Используем math/rand/v2, криптостойкость не требуется для игры.
 	//nolint:gosec // G404: игровой генератор, не для криптографии
 	rand.Shuffle(len(cards), func(i, j int) { cards[i], cards[j] = cards[j], cards[i] })
 
@@ -294,22 +297,20 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// fileLogger пишет логи в файл.
+// fileLogger пишет логи в файл (дописывает, не обрезает).
 type fileLogger struct {
 	file *os.File
 	log  *log.Logger
 }
 
-// newFileLogger создаёт логгер, пишущий в указанный файл.
-// Если файл не удаётся создать, возвращает nil, false.
+// newFileLogger создаёт логгер, пишущий в указанный файл (с добавлением).
 //
 //nolint:ireturn // возврат интерфейса допустим для фабрики
 func newFileLogger(filename string) (Logger, error) {
-	// Имя файла фиксировано (const), поэтому безопасно.
 	//nolint:gosec // G304: путь не из пользовательского ввода
-	file, err := os.Create(filename)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, defaultSaveFileMode)
 	if err != nil {
-		return nil, fmt.Errorf("создание лог-файла: %w", err)
+		return nil, fmt.Errorf("открытие лог-файла: %w", err)
 	}
 
 	return &fileLogger{
@@ -319,18 +320,16 @@ func newFileLogger(filename string) (Logger, error) {
 }
 
 func (l *fileLogger) Printf(format string, v ...any) {
-	if l != nil && l.log != nil {
-		l.log.Printf(format, v...)
-	}
+	l.log.Printf(format, v...)
 }
 
 // Close закрывает файл лога.
 func (l *fileLogger) Close() error {
-	if l != nil && l.file != nil {
-		return l.file.Close() //nolint:wrapcheck // обёртывание не требуется
+	if l == nil || l.file == nil {
+		return nil
 	}
 
-	return nil
+	return l.file.Close() //nolint:wrapcheck // обёртывание не требуется
 }
 
 // noopLogger ничего не делает.
@@ -392,9 +391,7 @@ func loadGame() (int, int, error) {
 }
 
 func resetSave() error {
-	path := savePath()
-
-	err := os.Remove(path)
+	err := os.Remove(savePath())
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("удаление файла сохранения: %w", err)
 	}
@@ -424,7 +421,7 @@ func (c *consoleIO) ReadString(prompt string) (string, error) {
 
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
-		return "", err //nolint:wrapcheck // ошибка не обёрнута, достаточно
+		return "", err //nolint:wrapcheck
 	}
 
 	return strings.TrimSpace(line), nil
@@ -477,33 +474,21 @@ func loadOrInitGame(cfg config, logger Logger, console ioInterface) *game {
 			console.Printf("   Баланс казино: $%d\n", cfg.initialDealer)
 		}
 
-		gameInstance.player = cfg.initialPlayer
-		gameInstance.dealer = cfg.initialDealer
-		logger.Printf("=== НОВАЯ ИГРА === Начальный баланс: игрок $%d, казино $%d", gameInstance.player, gameInstance.dealer)
-	} else {
-		// Если загруженный баланс некорректен (<=0) – сбрасываем и начинаем новую
-		if player <= 0 || dealer <= 0 {
-			_ = resetSave()
+		logger.Printf("=== НОВАЯ ИГРА === Начальный баланс: игрок $%d, казино $%d",
+			gameInstance.player, gameInstance.dealer)
 
-			console.Printf("🔄 Сохранение повреждено (баланс <=0), начинаем новую игру.\n")
-
-			gameInstance.player = cfg.initialPlayer
-			gameInstance.dealer = cfg.initialDealer
-			logger.Printf(
-				"=== НОВАЯ ИГРА (сброс повреждённого сохранения) === игрок $%d, казино $%d",
-				gameInstance.player, gameInstance.dealer,
-			)
-		} else {
-			console.Printf("📂 Загружено сохранение:\n   Ваш баланс: $%d\n   Баланс казино: $%d\n", player, dealer)
-			gameInstance.player = player
-			gameInstance.dealer = dealer
-			logger.Printf("=== ЗАГРУЖЕНА ИГРА === игрок $%d, казино $%d", gameInstance.player, gameInstance.dealer)
-		}
+		return gameInstance
 	}
+
+	console.Printf("📂 Загружено сохранение:\n   Ваш баланс: $%d\n   Баланс казино: $%d\n", player, dealer)
+	gameInstance.player = player
+	gameInstance.dealer = dealer
+	logger.Printf("=== ЗАГРУЖЕНА ИГРА === игрок $%d, казино $%d", gameInstance.player, gameInstance.dealer)
 
 	return gameInstance
 }
 
+// run — игровой цикл. Разбит на помощников для снижения цикломатической сложности.
 func (g *game) run() {
 	g.console.Println("=== ДОБРО ПОЖАЛОВАТЬ В CASINO BLACKJACK ===")
 
@@ -514,19 +499,32 @@ func (g *game) run() {
 			break
 		}
 
-		if g.player > 0 {
-			err := saveGame(g.player, g.dealer)
-			if err != nil {
-				g.console.Printf("⚠️ Не удалось сохранить прогресс: %v\n", err)
-				g.logger.Printf("Ошибка сохранения: %v", err)
-			}
-		}
+		g.saveProgress()
 	}
 
 	if g.player <= 0 {
 		_ = resetSave()
 	}
 
+	g.printFinalMessage()
+	g.logger.Printf("=== ИГРА ЗАВЕРШЕНА === Итог: игрок $%d, казино $%d", g.player, g.dealer)
+}
+
+// saveProgress сохраняет игру, только если оба баланса положительны.
+func (g *game) saveProgress() {
+	if g.player <= 0 || g.dealer <= 0 {
+		return
+	}
+
+	err := saveGame(g.player, g.dealer)
+	if err != nil {
+		g.console.Printf("⚠️ Не удалось сохранить прогресс: %v\n", err)
+		g.logger.Printf("Ошибка сохранения: %v", err)
+	}
+}
+
+// printFinalMessage выводит финальное сообщение в зависимости от исхода.
+func (g *game) printFinalMessage() {
 	g.console.Println("\n=== ИГРА ОКОНЧЕНА ===")
 
 	switch {
@@ -537,25 +535,12 @@ func (g *game) run() {
 	default:
 		g.console.Printf("Вы вышли из игры. Итоговый капитал: $%d\n", g.player)
 	}
-
-	g.logger.Printf("=== ИГРА ЗАВЕРШЕНА === Итог: игрок $%d, казино $%d", g.player, g.dealer)
 }
 
-// playRound выполняет один игровой раунд:
-//  1. Чтение ставки.
-//  2. Раздача карт игроку и дилеру.
-//  3. Предложение even money (если у игрока блэкджек и у дилера туз).
-//  4. Предложение страховки (если у дилера туз).
-//  5. Проверка на блэкджек у обоих.
-//  6. Ход игрока (включая сплиты).
-//  7. Ход дилера.
-//  8. Подведение итогов по всем рукам.
-//
-// Возвращает false, если игрок завершил игру (ввод 'q').
+// playRound выполняет один игровой раунд.
 //
 //nolint:cyclop,funlen // сложность и длина оправданы, разбивать дальше нецелесообразно
 func (g *game) playRound() bool {
-	// Проверка, что казино ещё не разорено
 	if g.dealer <= 0 {
 		g.console.Println("🏆 Казино разорено! Игра окончена.")
 
@@ -591,31 +576,25 @@ func (g *game) playRound() bool {
 	g.logger.Printf("Игрок: %s", playerHands[0].String())
 	g.logger.Printf("Дилер: %s + [скрыто]", dealerHand.Cards[0].Value+dealerHand.Cards[0].Suit)
 
-	// 1. Even money (если у игрока блэкджек и у дилера туз)
 	if playerHands[0].IsBlackjack() && dealerHand.Cards[0].Value == "A" {
 		if g.handleEvenMoney(bet) {
 			return true
 		}
 	}
 
-	// 2. Страховка (если у дилера туз)
 	insuranceTaken, insuranceBet := false, 0
 	if dealerHand.Cards[0].Value == "A" {
 		insuranceTaken, insuranceBet = g.offerInsurance(bet)
 	}
 
-	// 3. Проверка блэкджека
 	if g.resolveBlackjacks(&playerHands[0], &dealerHand, insuranceTaken, insuranceBet) {
-		// Если был блэкджек, раунд завершён
 		return true
 	}
 
-	// Если страховка была, но блэкджека не было – сообщаем
 	if insuranceTaken {
 		g.console.Println("❌ Страховка не сыграла.")
 	}
 
-	// 4. Ход игрока
 	surrendered := g.processPlayerHands(&playerHands, &dealerHand)
 	if surrendered {
 		refund := bet / surrenderRefundDiv
@@ -627,29 +606,26 @@ func (g *game) playRound() bool {
 		return true
 	}
 
-	// 5. Ход дилера
 	if !g.allBusted(playerHands) {
 		g.dealerTurn(&dealerHand)
 	}
 
-	// 6. Подведение итогов
 	g.resolveAllHands(playerHands, dealerHand)
 
 	return true
 }
 
-// вспомогательные методы, разбивающие логику playRound
-
 func (g *game) reshuffleIfNeeded() {
 	if g.shoe.NeedsCut(g.cfg.cutDivisor) {
 		g.console.Println("🃏 Карта среза: перетасовка новой обуви.")
+		g.logger.Printf("Перетасовка: осталось %d/%d карт (cutDivisor=%d)",
+			len(g.shoe.Cards), g.shoe.total, g.cfg.cutDivisor)
+
 		g.shoe = newShoe(g.cfg.numDecks)
-		g.logger.Printf("Перетасовка по карте среза (<= 1/%d)", g.cfg.cutDivisor)
 	}
 }
 
 // handleEvenMoney предлагает even money и возвращает true, если игрок согласился.
-// В этом случае раунд завершается.
 func (g *game) handleEvenMoney(bet int) bool {
 	g.console.Println("У вас Блэкджек! У дилера открыт ТУЗ.")
 
@@ -660,17 +636,17 @@ func (g *game) handleEvenMoney(bet int) bool {
 		return false
 	}
 
-	if strings.ToLower(ans) == "y" {
-		win := bet
-		g.player += bet + win
-		g.dealer -= bet + win
-		g.logger.Printf("Even money принято, выигрыш $%d", win)
-		g.console.Printf("✅ Вы получили $%d (1:1). Раунд завершён.\n", win)
-
-		return true
+	if !isYes(ans) {
+		return false
 	}
 
-	return false
+	profit := bet
+	g.player += bet + profit
+	g.dealer -= bet + profit
+	g.logger.Printf("Even money принято, прибыль $%d", profit)
+	g.console.Printf("✅ Even money: прибыль $%d (возврат ставки + 1:1). Раунд завершён.\n", profit)
+
+	return true
 }
 
 // offerInsurance предлагает страховку, возвращает (принята ли, размер ставки).
@@ -687,72 +663,97 @@ func (g *game) offerInsurance(bet int) (bool, int) {
 		return false, 0
 	}
 
-	if strings.ToLower(ans) == "y" {
-		g.player -= insuranceBet
-		g.dealer += insuranceBet
-		g.logger.Printf("Страховка принята: игрок заплатил $%d", insuranceBet)
-		g.console.Printf("✅ Страховка принята ($%d).\n", insuranceBet)
-
-		return true, insuranceBet
+	if !isYes(ans) {
+		return false, 0
 	}
 
-	return false, 0
+	g.player -= insuranceBet
+	g.dealer += insuranceBet
+	g.logger.Printf("Страховка принята: игрок заплатил $%d", insuranceBet)
+	g.console.Printf("✅ Страховка принята ($%d).\n", insuranceBet)
+
+	return true, insuranceBet
 }
 
-// resolveBlackjacks обрабатывает ситуации с блэкджеком у игрока и/или дилера.
-// Возвращает true, если блэкджек был у кого-то (раунд завершён).
-func (g *game) resolveBlackjacks(playerHand *hand, dealerHand *hand, insuranceTaken bool, insuranceBet int) bool {
-	if !playerHand.IsBlackjack() && !dealerHand.IsBlackjack() {
+// resolveBlackjacks обрабатывает ситуации с блэкджеком.
+// Разбит на помощников для снижения длины и сложности.
+func (g *game) resolveBlackjacks(
+	playerHand *hand,
+	dealerHand *hand,
+	insuranceTaken bool,
+	insuranceBet int,
+) bool {
+	playerBJ := playerHand.IsBlackjack()
+	dealerBJ := dealerHand.IsBlackjack()
+
+	if !playerBJ && !dealerBJ {
 		return false
 	}
 
 	g.showInitialHands(*playerHand, *dealerHand)
 
-	if dealerHand.IsBlackjack() && playerHand.IsBlackjack() {
-		// Ничья: ставка возвращается
-		g.player += playerHand.Bet
-		g.dealer -= playerHand.Bet
-
-		if insuranceTaken {
-			win := insuranceBet * insurancePayoutMul
-			g.player += win
-			g.dealer -= win
-			g.logger.Printf("Оба блэкджек, страховка выиграла +$%d", win)
-			g.console.Printf("🛡️ Страховка выиграла! +$%d\n", win)
-		}
-
-		g.logger.Printf("Ничья (оба блэкджек), ставка возвращена")
-		g.console.Println("🤝 У обоих Блэкджек – ничья (ставка возвращена).")
-
-		return true
+	switch {
+	case dealerBJ && playerBJ:
+		g.handleBothBlackjack(playerHand, insuranceTaken, insuranceBet)
+	case dealerBJ:
+		g.handleDealerBlackjack(insuranceTaken, insuranceBet)
+	default:
+		g.handlePlayerBlackjack(playerHand, insuranceTaken)
 	}
 
-	if dealerHand.IsBlackjack() {
-		if insuranceTaken {
-			win := insuranceBet * insurancePayoutMul
-			g.player += win
-			g.dealer -= win
-			g.logger.Printf("Дилер блэкджек, страховка выиграла +$%d", win)
-			g.console.Printf("🛡️ Страховка выиграла! +$%d (основная ставка проиграна).\n", win)
-		} else {
-			g.logger.Printf("Дилер блэкджек, игрок проиграл ставку")
-			g.console.Println("💀 У дилера Блэкджек. Вы проиграли.")
-		}
+	return true
+}
 
-		return true
+// payInsurance выплачивает страховку (возврат ставки + прибыль 2:1).
+func (g *game) payInsurance(insuranceTaken bool, insuranceBet int) {
+	if !insuranceTaken || insuranceBet <= 0 {
+		return
 	}
 
-	if playerHand.IsBlackjack() {
-		win := playerHand.Bet * blackjackPayoutMul / blackjackPayoutDenom // 3:2
-		g.player += playerHand.Bet + win
-		g.dealer -= playerHand.Bet + win
-		g.logger.Printf("Игрок блэкджек, выигрыш $%d (3:2)", win)
-		g.console.Printf("🎉 Натуральный Блэкджек! Выигрыш 3:2: +$%d\n", win)
+	profit := insuranceBet * insurancePayoutMul
+	fullReturn := insuranceBet + profit
+	g.player += fullReturn
+	g.dealer -= fullReturn
+	g.logger.Printf("Страховка выиграла: возврат $%d (прибыль $%d)", fullReturn, profit)
+	g.console.Printf("🛡️ Страховка выиграла! Прибыль $%d (возврат $%d)\n", profit, fullReturn)
+}
 
-		return true
+// handleBothBlackjack — ничья при блэкджеках с обеих сторон.
+func (g *game) handleBothBlackjack(playerHand *hand, insuranceTaken bool, insuranceBet int) {
+	g.player += playerHand.Bet
+	g.dealer -= playerHand.Bet
+
+	g.payInsurance(insuranceTaken, insuranceBet)
+
+	g.logger.Printf("Ничья (оба блэкджек), ставка возвращена")
+	g.console.Println("🤝 У обоих Блэкджек – ничья (ставка возвращена).")
+}
+
+// handleDealerBlackjack — блэкджек только у дилера.
+func (g *game) handleDealerBlackjack(insuranceTaken bool, insuranceBet int) {
+	if insuranceTaken {
+		g.payInsurance(insuranceTaken, insuranceBet)
+		g.console.Println("💀 У дилера Блэкджек. Основная ставка проиграна (страховка компенсировала).")
+
+		return
 	}
 
-	return false
+	g.logger.Printf("Дилер блэкджек, игрок проиграл ставку")
+	g.console.Println("💀 У дилера Блэкджек. Вы проиграли.")
+}
+
+// handlePlayerBlackjack — блэкджек только у игрока.
+func (g *game) handlePlayerBlackjack(playerHand *hand, insuranceTaken bool) {
+	if insuranceTaken {
+		g.console.Println("❌ Страховка не сыграла (у дилера нет блэкджека).")
+		g.logger.Printf("Игрок блэкджек, страховка проиграна")
+	}
+
+	win := playerHand.Bet * blackjackPayoutMul / blackjackPayoutDenom // 3:2
+	g.player += playerHand.Bet + win
+	g.dealer -= playerHand.Bet + win
+	g.logger.Printf("Игрок блэкджек, прибыль $%d (3:2)", win)
+	g.console.Printf("🎉 Натуральный Блэкджек! Выигрыш 3:2: +$%d\n", win)
 }
 
 func (g *game) showInitialHands(playerHand, dealerHand hand) {
@@ -762,8 +763,6 @@ func (g *game) showInitialHands(playerHand, dealerHand hand) {
 	g.console.Println("Рука дилера: ")
 	dealerHand.Print(false)
 }
-
-// -------- остальные методы (с улучшениями) --------
 
 func (g *game) readBet() (int, bool) {
 	for {
@@ -780,11 +779,19 @@ func (g *game) readBet() (int, bool) {
 		}
 
 		bet, err := strconv.Atoi(input)
-		if err == nil && bet > 0 && bet <= g.player && bet <= g.dealer {
+
+		switch {
+		case err != nil:
+			g.console.Println("❌ Введите целое число.")
+		case bet <= 0:
+			g.console.Println("❌ Ставка должна быть положительной.")
+		case bet > g.player:
+			g.console.Printf("❌ Недостаточно средств. Ваш баланс: $%d\n", g.player)
+		case bet > g.dealer:
+			g.console.Printf("❌ У казино недостаточно средств ($%d)\n", g.dealer)
+		default:
 			return bet, true
 		}
-
-		g.console.Println("❌ Некорректная ставка или недостаточно средств!")
 	}
 }
 
@@ -844,7 +851,6 @@ func (g *game) showGameState(hands []hand, dealerHand hand, idx int) {
 	hands[idx].Print(false)
 }
 
-// getPlayerAction формирует строку опций и запрашивает ввод.
 func (g *game) getPlayerAction(handVal hand, totalHands int) string {
 	options := g.buildActionOptions(handVal, totalHands)
 
@@ -861,7 +867,6 @@ func (g *game) getPlayerAction(handVal hand, totalHands int) string {
 	}
 }
 
-// buildActionOptions выделена для снижения цикломатической сложности.
 func (g *game) buildActionOptions(handVal hand, totalHands int) string {
 	options := "[h] Взять, [s] Остановиться"
 
@@ -881,9 +886,12 @@ func (g *game) buildActionOptions(handVal hand, totalHands int) string {
 }
 
 // canDouble проверяет, можно ли удвоить ставку.
-// Учитывает настройку allowDoubleAfterSplit.
 func (g *game) canDouble(handVal hand) bool {
 	if len(handVal.Cards) != 2 || g.player < handVal.Bet || g.dealer < handVal.Bet {
+		return false
+	}
+
+	if handVal.IsSplitAce {
 		return false
 	}
 
@@ -891,24 +899,23 @@ func (g *game) canDouble(handVal hand) bool {
 		return false
 	}
 
-	score := handVal.Score()
-
-	return slices.Contains(g.cfg.doubleDownScores, score)
+	return slices.Contains(g.cfg.doubleDownScores, handVal.Score())
 }
 
+// canSplit проверяет возможность сплита с учётом лимита maxSplits.
 func (g *game) canSplit(handVal hand, totalHands int) bool {
 	if !handVal.CanSplit() || g.player < handVal.Bet || g.dealer < handVal.Bet {
 		return false
 	}
 
-	if g.cfg.maxSplits > 0 && totalHands >= g.cfg.maxSplits {
+	if g.cfg.maxSplits > 0 && totalHands > g.cfg.maxSplits {
 		return false
 	}
 
 	return true
 }
 
-// executeAction обрабатывает действия игрока.
+// executeAction обрабатывает действия игрока. Возвращает true при сдаче (surrender).
 func (g *game) executeAction(handPtr *hand, hands *[]hand, action string) bool {
 	action = strings.ToLower(action)
 
@@ -926,7 +933,7 @@ func (g *game) executeAction(handPtr *hand, hands *[]hand, action string) bool {
 			return true
 		}
 
-		g.console.Println("❌ Сдаться сейчас нельзя.")
+		g.console.Println("❌ Сдаться сейчас нельзя (только с двумя картами до сплитов).")
 	default:
 		g.console.Println("❌ Неизвестная команда.")
 	}
@@ -953,6 +960,18 @@ func (g *game) doStand(handPtr *hand) {
 func (g *game) doDouble(handPtr *hand) {
 	if len(handPtr.Cards) != 2 || g.player < handPtr.Bet || g.dealer < handPtr.Bet {
 		g.console.Println("❌ Удвоить сейчас нельзя.")
+
+		return
+	}
+
+	if handPtr.IsSplitAce {
+		g.console.Println("❌ Удвоение сплит-тузов запрещено.")
+
+		return
+	}
+
+	if handPtr.IsSplit && !g.cfg.allowDoubleAfterSplit {
+		g.console.Println("❌ Удвоение после сплита запрещено правилами.")
 
 		return
 	}
@@ -985,7 +1004,7 @@ func (g *game) doSplit(handPtr *hand, hands *[]hand) {
 		return
 	}
 
-	if g.cfg.maxSplits > 0 && len(*hands) >= g.cfg.maxSplits {
+	if g.cfg.maxSplits > 0 && len(*hands) > g.cfg.maxSplits {
 		g.console.Println("❌ Достигнут лимит сплитов.")
 
 		return
@@ -1035,11 +1054,21 @@ func (g *game) allBusted(hands []hand) bool {
 func (g *game) dealerTurn(dealerHand *hand) {
 	g.console.Println("\n=== ХОД ДИЛЕРА ===")
 
+	first := true
+
 	for dealerHand.Score() < 17 || (g.cfg.dealerHitsSoft17 && dealerHand.Score() == 17 && dealerHand.IsSoft()) {
 		g.console.Println("Рука дилера: ")
 		dealerHand.Print(false)
-		g.console.Println("Дилер берёт карту...")
-		time.Sleep(dealerSleepMs * time.Millisecond)
+
+		if g.cfg.dealerSleepMs > 0 {
+			if first {
+				g.console.Println("Дилер берёт карту...")
+
+				first = false
+			}
+
+			time.Sleep(time.Duration(g.cfg.dealerSleepMs) * time.Millisecond)
+		}
 
 		c := g.shoe.Draw(g.cfg.numDecks)
 		dealerHand.Cards = append(dealerHand.Cards, c)
@@ -1073,21 +1102,25 @@ func (g *game) resolveHand(handVal hand, dScore int) {
 	case pScore > maxScore:
 		g.console.Println("Перебор! Вы проиграли.")
 		g.logger.Printf("Рука %s (очки %d) – перебор, проигрыш", handVal.String(), pScore)
+
 	case dScore > maxScore:
-		g.console.Printf("У дилера перебор! Вы выиграли +$%d\n", handVal.Bet)
 		winAmount := handVal.Bet * payoutReturnFactor
 		g.player += winAmount
 		g.dealer -= winAmount
-		g.logger.Printf("Рука %s – победа (дилер перебор), +$%d", handVal.String(), handVal.Bet)
+		g.console.Printf("У дилера перебор! Возврат $%d, прибыль $%d\n", winAmount, handVal.Bet)
+		g.logger.Printf("Рука %s – победа (дилер перебор), возврат $%d", handVal.String(), winAmount)
+
 	case pScore > dScore:
-		g.console.Printf("Победа! +$%d\n", handVal.Bet)
 		winAmount := handVal.Bet * payoutReturnFactor
 		g.player += winAmount
 		g.dealer -= winAmount
-		g.logger.Printf("Рука %s – победа, +$%d", handVal.String(), handVal.Bet)
+		g.console.Printf("Победа! Возврат $%d, прибыль $%d\n", winAmount, handVal.Bet)
+		g.logger.Printf("Рука %s – победа, возврат $%d", handVal.String(), winAmount)
+
 	case dScore > pScore:
 		g.console.Println("Дилер победил. Ставка проиграна.")
 		g.logger.Printf("Рука %s – проигрыш", handVal.String())
+
 	default:
 		g.console.Println("Ничья (Пуш). Ставка возвращена.")
 		g.player += handVal.Bet
@@ -1096,16 +1129,17 @@ func (g *game) resolveHand(handVal hand, dScore int) {
 	}
 }
 
-// -------------------- Разбор аргументов командной строки (с использованием flag) --------------------
+// -------------------- Разбор аргументов командной строки --------------------
 
 type cliArgs struct {
 	reset      bool
 	log        bool
 	playerInit int
 	dealerInit int
+	numDecks   int
+	speedMs    int
 }
 
-// parseArgs разбирает аргументы командной строки с помощью пакета flag.
 func parseArgs() cliArgs {
 	var args cliArgs
 
@@ -1113,6 +1147,8 @@ func parseArgs() cliArgs {
 	flag.BoolVar(&args.log, "log", false, "Включить логирование в файл "+defaultLogFile)
 	flag.IntVar(&args.playerInit, "player", -1, "Начальный баланс игрока (если не указан, берётся из конфига)")
 	flag.IntVar(&args.dealerInit, "dealer", -1, "Начальный баланс казино (если не указан, берётся из конфига)")
+	flag.IntVar(&args.numDecks, "decks", -1, "Число колод в обуви")
+	flag.IntVar(&args.speedMs, "speed", -1, "Задержка дилера в мс (0 — без задержки)")
 	flag.Parse()
 
 	return args
@@ -1120,19 +1156,38 @@ func parseArgs() cliArgs {
 
 // -------------------- Точка входа --------------------
 
+// main разбит на помощников для снижения цикломатической сложности.
 func main() {
 	cfg := defaultConfig()
 	cli := parseArgs()
 
-	if cli.reset {
-		err := resetSave()
-		if err != nil {
-			fmt.Println("⚠️ Не удалось сбросить сохранение:", err) //nolint:forbidigo
-		} else {
-			fmt.Println("🗑️ Прогресс сброшен.") //nolint:forbidigo
-		}
+	handleReset(cli.reset)
+	applyCLIOverrides(&cfg, cli)
+
+	logger, closeLogger := setupLogger(cli.log)
+	defer closeLogger()
+
+	console := newConsoleIO()
+	gameInstance := loadOrInitGame(cfg, logger, console)
+	gameInstance.run()
+}
+
+// handleReset сбрасывает сохранение при -reset.
+func handleReset(do bool) {
+	if !do {
+		return
 	}
 
+	err := resetSave()
+	if err != nil {
+		fmt.Println("⚠️ Не удалось сбросить сохранение:", err) //nolint:forbidigo
+	} else {
+		fmt.Println("🗑️ Прогресс сброшен.") //nolint:forbidigo
+	}
+}
+
+// applyCLIOverrides применяет CLI-флаги к конфигу.
+func applyCLIOverrides(cfg *config, cli cliArgs) {
 	if cli.playerInit > 0 {
 		cfg.initialPlayer = cli.playerInit
 	}
@@ -1141,34 +1196,52 @@ func main() {
 		cfg.initialDealer = cli.dealerInit
 	}
 
-	var logger Logger
-
-	//nolint:nestif // сложность блока оправдана настройкой логгера
-	if cli.log {
-		flogger, err := newFileLogger(defaultLogFile)
-		if err != nil {
-			fmt.Printf("⚠️ Не удалось создать лог-файл: %v. Логирование отключено.\n", err) //nolint:forbidigo
-
-			logger = noopLogger{}
-		} else {
-			fmt.Printf("📝 Логирование включено (файл %s)\n", defaultLogFile) //nolint:forbidigo
-
-			logger = flogger
-
-			defer func() {
-				if fl, ok := logger.(*fileLogger); ok && fl != nil {
-					err := fl.Close()
-					if err != nil {
-						fmt.Printf("⚠️ Ошибка закрытия лог-файла: %v\n", err) //nolint:forbidigo
-					}
-				}
-			}()
-		}
-	} else {
-		logger = noopLogger{}
+	if cli.numDecks > 0 {
+		cfg.numDecks = cli.numDecks
 	}
 
-	console := newConsoleIO()
-	gameInstance := loadOrInitGame(cfg, logger, console)
-	gameInstance.run()
+	if cli.speedMs >= 0 {
+		cfg.dealerSleepMs = cli.speedMs
+	}
+}
+
+// setupLogger создаёт логгер и возвращает функцию закрытия.
+//
+//nolint:ireturn // возврат интерфейса допустим для фабрики
+func setupLogger(enable bool) (Logger, func()) {
+	if !enable {
+		return noopLogger{}, func() {}
+	}
+
+	flogger, err := newFileLogger(defaultLogFile)
+	if err != nil {
+		fmt.Printf("⚠️ Не удалось создать лог-файл: %v. Логирование отключено.\n", err) //nolint:forbidigo
+
+		return noopLogger{}, func() {}
+	}
+
+	fmt.Printf("📝 Логирование включено (файл %s)\n", defaultLogFile) //nolint:forbidigo
+
+	closer := func() {
+		if fl, ok := flogger.(*fileLogger); ok && fl != nil {
+			err := fl.Close()
+			if err != nil {
+				fmt.Printf("⚠️ Ошибка закрытия лог-файла: %v\n", err) //nolint:forbidigo
+			}
+		}
+	}
+
+	return flogger, closer
+}
+
+// -------------------- Утилиты --------------------
+
+// isYes принимает разные варианты «да».
+func isYes(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "y", "yes", "д", "да":
+		return true
+	default:
+		return false
+	}
 }
